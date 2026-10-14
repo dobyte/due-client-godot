@@ -1,0 +1,5 @@
+# Godot 4 缓存
+.godot/
+
+# macOS
+.DS_Store

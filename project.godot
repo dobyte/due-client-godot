@@ -1,0 +1,8 @@
+; Engine configuration file.
+; 用于运行单元测试的最小 Godot 项目配置。
+
+config_version=5
+
+[application]
+
+config/name="due-client-godot"
