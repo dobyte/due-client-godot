@@ -6,7 +6,8 @@ extends RefCounted
 ## 协议格式（字节序可配置为 big/little，默认 big）：
 ##   [size: 4字节][header: 1字节][route: route_bytes字节][seq: seq_bytes字节][buffer]
 ## 其中 size 为 header 之后的总字节数；心跳包的 header 最高位为 1，
-## 且可选携带 8 字节的服务器时间戳（毫秒）。
+## 且可选携带 8 字节的服务器时间戳（毫秒）；握手包的 header 最低位为 1，
+## 不携带路由与序列号，其后的数据为握手帧内容。
 
 const BIG_ENDIAN := "big"
 const LITTLE_ENDIAN := "little"
@@ -17,6 +18,11 @@ const DEFAULT_HEADER_BYTES := 1
 const DEFAULT_ROUTE_BYTES := 2
 const DEFAULT_SEQ_BYTES := 2
 const DEFAULT_BUFFER_BYTES := 5000
+
+## header 位的心跳帧标记
+const HEADER_HEARTBEAT := 1 << 7
+## header 位的握手帧标记
+const HEADER_HANDSHAKE := 1 << 0
 
 ## 字节序，可选 "big" 或 "little"，默认为 "big"
 var byte_order: String
@@ -41,6 +47,24 @@ func _init(opts: Dictionary = {}) -> void:
 ## 打包心跳包
 func pack_heartbeat() -> PackedByteArray:
 	return _heartbeat
+
+
+## 打包握手帧；握手帧不含路由与序列号，仅由 header 标记
+## 出错时返回空 PackedByteArray
+func pack_handshake(payload: PackedByteArray) -> PackedByteArray:
+	if payload.size() > buffer_bytes:
+		push_error("due-client: handshake payload too large")
+		return PackedByteArray()
+
+	var size: int = DEFAULT_HEADER_BYTES + payload.size()
+
+	var stream := StreamPeerBuffer.new()
+	stream.big_endian = _is_big_endian()
+	stream.put_u32(size)
+	stream.put_u8(HEADER_HANDSHAKE)
+	stream.put_data(payload)
+
+	return stream.data_array
 
 
 ## 打包消息
@@ -75,7 +99,10 @@ func pack_message(message: Dictionary) -> PackedByteArray:
 
 
 ## 解包数据
-## 返回结构：{ "is_heartbeat": bool, "millisecond": int, "message": Dictionary }
+## 返回结构：
+##   心跳帧：{ "is_heartbeat": true, "is_handshake": false, "millisecond": int }
+##   握手帧：{ "is_heartbeat": false, "is_handshake": true, "payload": PackedByteArray }
+##   消息帧：{ "is_heartbeat": false, "is_handshake": false, "message": Dictionary }
 func unpack(data: PackedByteArray) -> Dictionary:
 	if data.size() < DEFAULT_SIZE_BYTES + DEFAULT_HEADER_BYTES:
 		push_error("due-client: invalid packet")
@@ -88,13 +115,21 @@ func unpack(data: PackedByteArray) -> Dictionary:
 
 	var size: int = stream.get_u32()
 	var header: int = stream.get_u8()
-	var is_heartbeat: bool = (header >> 7) == 1
 
-	if is_heartbeat:
-		var result := { "is_heartbeat": true, "millisecond": 0 }
+	if (header & HEADER_HEARTBEAT) != 0:
+		var result := { "is_heartbeat": true, "is_handshake": false, "millisecond": 0 }
 		if size + DEFAULT_SIZE_BYTES > stream.get_position():
 			result["millisecond"] = stream.get_u64()
 		return result
+
+	if (header & HEADER_HANDSHAKE) != 0:
+		var offset: int = stream.get_position()
+		var end: int = mini(size + DEFAULT_SIZE_BYTES, data.size())
+		return {
+			"is_heartbeat": false,
+			"is_handshake": true,
+			"payload": data.slice(offset, end),
+		}
 
 	var message := { "seq": 0, "route": 0, "buffer": PackedByteArray() }
 	if route_bytes > 0:
@@ -106,14 +141,14 @@ func unpack(data: PackedByteArray) -> Dictionary:
 		var offset: int = stream.get_position()
 		message["buffer"] = data.slice(offset, size + DEFAULT_SIZE_BYTES)
 
-	return { "is_heartbeat": false, "message": message }
+	return { "is_heartbeat": false, "is_handshake": false, "message": message }
 
 
 func _do_pack_heartbeat() -> PackedByteArray:
 	var stream := StreamPeerBuffer.new()
 	stream.big_endian = _is_big_endian()
 	stream.put_u32(DEFAULT_HEADER_BYTES)  # size = 1
-	stream.put_u8(1 << 7)  # header：心跳包
+	stream.put_u8(HEADER_HEARTBEAT)  # header：心跳包
 	return stream.data_array
 
 

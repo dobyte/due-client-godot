@@ -11,6 +11,10 @@ extends Node
 ##         "reconnect_interval": 3000,
 ##         "reconnect_max_attempts": 0,
 ##         "packer": DuePacker.new({ "byte_order": "big", "seq_bytes": 0, "route_bytes": 4 }),
+##         # 可选：启用会话安全
+##         "security": DueSecurityOptions.new({
+##             "verifier": DueVerifier.ecdsa("keys/gate.pub.pem"),
+##         }),
 ##     })
 ##     add_child(client)
 ##     client.connected.connect(_on_connected)
@@ -19,6 +23,9 @@ extends Node
 ##     client.connect_server()
 
 const DuePackerScript := preload("res://addons/due_client/due_packer.gd")
+const DueSecurityOptionsScript := preload("res://addons/due_client/security/due_security_options.gd")
+const DueHandshakeScript := preload("res://addons/due_client/security/due_handshake.gd")
+const DueSessionScript := preload("res://addons/due_client/security/due_session.gd")
 
 ## 连接状态
 enum State {
@@ -53,6 +60,8 @@ var url: String = ""
 var heartbeat_interval: int = 0
 ## 打包器
 var packer: DuePackerScript
+## 会话安全配置；为 null 时表示不启用安全模式
+var security: DueSecurityOptionsScript
 
 ## 是否自动重连，默认为 false
 var auto_reconnect: bool = false
@@ -64,9 +73,16 @@ var reconnect_max_attempts: int = 0
 var _socket: WebSocketPeer
 var _heartbeat_timer: Timer
 var _reconnect_timer: Timer
+var _handshake_timer: Timer
 var _state: int = State.DISCONNECTED
 var _reconnect_attempts: int = 0
 var _manual_close: bool = false
+## 连接是否已就绪（安全模式下为握手完成）
+var _established: bool = false
+## 握手状态
+var _handshake: DueHandshakeScript
+## 会话密钥
+var _session: DueSessionScript
 ## route -> { "seq": int, "callbacks": { seq: _Deferred } }
 var _waitgroup: Dictionary = {}
 
@@ -80,6 +96,7 @@ func _init(opts: Dictionary = {}) -> void:
 	packer = opts.get("packer")
 	if packer == null:
 		packer = DuePackerScript.new({})
+	security = _normalize_security(opts.get("security"))
 
 
 func _ready() -> void:
@@ -95,10 +112,17 @@ func _ready() -> void:
 	add_child(_reconnect_timer)
 	_reconnect_timer.timeout.connect(_on_reconnect_timeout)
 
+	_handshake_timer = Timer.new()
+	_handshake_timer.name = "DueHandshakeTimer"
+	_handshake_timer.one_shot = true
+	add_child(_handshake_timer)
+	_handshake_timer.timeout.connect(_on_handshake_timeout)
+
 
 func _exit_tree() -> void:
 	_stop_heartbeat()
 	_stop_reconnect()
+	_stop_handshake_timer()
 
 
 func _process(_delta: float) -> void:
@@ -109,21 +133,29 @@ func _process(_delta: float) -> void:
 	var ws_state := _socket.get_ready_state()
 
 	if ws_state == WebSocketPeer.STATE_OPEN:
-		if _state != State.CONNECTED:
+		if not _established:
+			_established = true
 			_reconnect_attempts = 0
-			_start_heartbeat()
-			_set_state(State.CONNECTED)
-			connected.emit()
+			if security != null:
+				_start_handshake()
+			else:
+				_on_established()
 	elif ws_state == WebSocketPeer.STATE_CLOSED:
 		if _state == State.CONNECTED:
+			_established = false
 			_stop_heartbeat()
 			_clear_waitgroup()
+			_clear_security()
 			_set_state(State.DISCONNECTED)
 			disconnected.emit()
 			_maybe_reconnect()
 		elif _state == State.CONNECTING:
+			_established = false
+			_stop_handshake_timer()
+			_clear_security()
 			_set_state(State.DISCONNECTED)
-			error.emit("connection closed before open")
+			if not _manual_close:
+				error.emit("connection closed before open")
 			_maybe_reconnect()
 
 	while _socket.get_available_packet_count() > 0:
@@ -176,9 +208,26 @@ func is_connecting() -> bool:
 
 ## 发送异步消息
 ## message 结构：{ "seq": int, "route": int, "buffer": PackedByteArray }
+## 安全模式下会对 buffer 加密，握手完成前发送会返回 false
 func send(message: Dictionary) -> bool:
 	if not is_open():
 		return false
+
+	if security != null:
+		if _session == null:
+			push_warning("due-client: security session is not established")
+			return false
+		var sealed := _session.seal_message(
+			message.get("buffer", PackedByteArray()),
+			DueSessionScript.Direction.CLIENT_TO_SERVER,
+			message.get("route", 0),
+			message.get("seq", 0)
+		)
+		if sealed.is_empty():
+			return false
+		message = message.duplicate()
+		message["buffer"] = sealed
+
 	var data := packer.pack_message(message)
 	if data.is_empty():
 		return false
@@ -237,12 +286,34 @@ func _handle_binary(data: PackedByteArray) -> void:
 	var packet: Dictionary = packer.unpack(data)
 	if packet.is_empty():
 		return
+
+	if packet.get("is_handshake", false):
+		_handle_handshake(packet.get("payload", PackedByteArray()))
+		return
+
 	if packet.get("is_heartbeat", false):
 		heartbeat.emit(packet.get("millisecond", 0))
-	else:
-		var message: Dictionary = packet.get("message", {})
-		if not _invoke(message):
-			received.emit(message)
+		return
+
+	var message: Dictionary = packet.get("message", {})
+	if security != null:
+		if _session == null:
+			push_error("due-client: security session is not established")
+			return
+		var sealed_buffer: PackedByteArray = message.get("buffer", PackedByteArray())
+		var route: int = message.get("route", 0)
+		var seq: int = message.get("seq", 0)
+		var plaintext := _session.open_message(
+			sealed_buffer, DueSessionScript.Direction.SERVER_TO_CLIENT, route, seq
+		)
+		# 解密成功时明文长度必然等于密文长度减去信封开销
+		if plaintext.size() != sealed_buffer.size() - _session.get_overhead():
+			error.emit("decrypt message failed")
+			return
+		message["buffer"] = plaintext
+
+	if not _invoke(message):
+		received.emit(message)
 
 
 func _invoke(message: Dictionary) -> bool:
@@ -273,10 +344,111 @@ func _cleanup() -> void:
 	_stop_heartbeat()
 	_stop_reconnect()
 	_clear_waitgroup()
+	_clear_security()
+	_established = false
 	if _socket != null:
 		var ws_state := _socket.get_ready_state()
 		if ws_state == WebSocketPeer.STATE_OPEN or ws_state == WebSocketPeer.STATE_CONNECTING:
 			_socket.close()
+
+
+## 连接就绪：启动心跳并触发连接回调；安全模式下在握手完成后调用
+func _on_established() -> void:
+	_start_heartbeat()
+	_set_state(State.CONNECTED)
+	connected.emit()
+
+
+## 发起会话安全握手
+func _start_handshake() -> void:
+	if not security.verifier.is_valid():
+		_fail_handshake("invalid server verifier")
+		return
+
+	_handshake = DueHandshakeScript.new(security.verifier, security.suites)
+	var hello := _handshake.hello()
+	_start_handshake_timer()
+
+	if hello.is_empty() or not _send_raw(packer.pack_handshake(hello)):
+		_fail_handshake("send client hello failed")
+
+
+## 处理服务端握手帧
+func _handle_handshake(payload: PackedByteArray) -> void:
+	if _handshake == null:
+		push_error("due-client: unexpected handshake frame")
+		return
+
+	var result := _handshake.handle(payload)
+	if not result.get("ok", false):
+		_fail_handshake(result.get("error", "handshake failed"))
+		return
+
+	# 先发布会话，再回发 Finished：服务端确认后可能立即下发加密消息
+	_session = result["session"]
+	_handshake = null
+	_stop_handshake_timer()
+
+	if not _send_raw(packer.pack_handshake(result["finished"])):
+		_session = null
+		_fail_handshake("send finished frame failed")
+		return
+
+	_on_established()
+
+
+## 握手失败：通知错误并断开连接
+func _fail_handshake(message: String) -> void:
+	push_error("due-client: " + message)
+	error.emit(message)
+	disconnect_server()
+
+
+## 启动握手超时定时器
+func _start_handshake_timer() -> void:
+	if _handshake_timer == null or security.handshake_timeout <= 0:
+		return
+	_handshake_timer.wait_time = security.handshake_timeout / 1000.0
+	_handshake_timer.start()
+
+
+## 停止握手超时定时器
+func _stop_handshake_timer() -> void:
+	if _handshake_timer != null:
+		_handshake_timer.stop()
+
+
+## 握手超时：断开连接
+func _on_handshake_timeout() -> void:
+	if _session != null:
+		return
+	_fail_handshake("security handshake timed out")
+
+
+## 清理握手状态与会话密钥
+func _clear_security() -> void:
+	_stop_handshake_timer()
+	_handshake = null
+	_session = null
+
+
+## 直接发送已打包的数据
+func _send_raw(data: PackedByteArray) -> bool:
+	if data.is_empty() or _socket == null:
+		return false
+	return _socket.send(data) == OK
+
+
+## 归一化安全配置，允许直接传入字典
+static func _normalize_security(value: Variant) -> DueSecurityOptionsScript:
+	if value == null:
+		return null
+	if value is DueSecurityOptionsScript:
+		return value
+	if value is Dictionary:
+		return DueSecurityOptionsScript.new(value)
+	push_error("due-client: invalid security options")
+	return null
 
 
 func _maybe_reconnect() -> void:

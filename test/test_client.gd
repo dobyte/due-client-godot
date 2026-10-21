@@ -8,13 +8,15 @@ const DueClientScript := preload("res://addons/due_client/due_client.gd")
 const DuePackerScript := preload("res://addons/due_client/due_packer.gd")
 
 const PORT := 9080
+## 与 due-benchmark/cluster/ws/client 的 etc.toml [packet] 配置一致
+const PACKET_OPTIONS := { "byte_order": "big", "route_bytes": 4, "seq_bytes": 4, "buffer_bytes": 5000 }
 
 var _server := TCPServer.new()
 var _server_peer: WebSocketPeer = null
-var _server_packer = DuePackerScript.new({ "byte_order": "big", "seq_bytes": 2, "route_bytes": 2 })
+var _server_packer = DuePackerScript.new(PACKET_OPTIONS)
 
 var _client
-var _client_packer = DuePackerScript.new({ "byte_order": "big", "seq_bytes": 2, "route_bytes": 2 })
+var _client_packer = DuePackerScript.new(PACKET_OPTIONS)
 
 var _passed := 0
 var _failed := 0
@@ -119,7 +121,6 @@ func _test_reconnect() -> void:
 
 
 func _poll_server() -> void:
-	_server.poll()
 	if _server.is_connection_available():
 		var stream := _server.take_connection()
 		if _server_peer != null and _server_peer.get_ready_state() == WebSocketPeer.STATE_OPEN:

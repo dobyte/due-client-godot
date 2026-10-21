@@ -21,6 +21,7 @@ func _init() -> void:
 	_test_roundtrip_route1_seq1()
 	_test_unpack_heartbeat()
 	_test_unpack_heartbeat_with_timestamp()
+	_test_pack_handshake()
 	_test_route_overflow()
 	_test_seq_overflow()
 	_test_buffer_too_large()
@@ -101,6 +102,26 @@ func _test_unpack_heartbeat_with_timestamp() -> void:
 	var packet := packer.unpack(stream.data_array)
 	_assert_eq(packet.get("is_heartbeat"), true, "带时间戳心跳解包类型")
 	_assert_eq(packet.get("millisecond"), ts, "带时间戳心跳毫秒")
+
+
+func _test_pack_handshake() -> void:
+	var payload := PackedByteArray([1, 2, 3])
+
+	var packer := DuePackerScript.new({ "byte_order": "big" })
+	var data := packer.pack_handshake(payload)
+	# size = 1 + 3 = 4，header = 0x01
+	_assert_eq(data, PackedByteArray([0, 0, 0, 4, 0x01, 1, 2, 3]), "握手帧打包（大端）")
+
+	var packet := packer.unpack(data)
+	_assert_eq(packet.get("is_handshake"), true, "握手帧解包类型")
+	_assert_eq(packet.get("payload"), payload, "握手帧解包数据")
+
+	var little := DuePackerScript.new({ "byte_order": "little" })
+	_assert_eq(
+		little.pack_handshake(payload),
+		PackedByteArray([4, 0, 0, 0, 0x01, 1, 2, 3]),
+		"握手帧打包（小端）"
+	)
 
 
 func _test_route_overflow() -> void:
