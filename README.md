@@ -339,6 +339,27 @@ godot --headless --script res://test/test_client_security.gd
 > （`byteOrder=big`、`routeBytes=4`、`seqBytes=4`、`bufferBytes=5000`）；
 > 安全测试使用与该 benchmark 相同的示例 ECDSA 密钥（`hash=SHA256`、`delimiter=空格`）。
 
+## 7. 版本发布
+
+仓库通过 GitHub Actions 自动发布版本，工作流文件为 [release.yml](.github/workflows/release.yml)。
+
+发布新版本只需推送 `v*` 标签：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+工作流会自动执行：
+
+1. 校验标签格式与插件目录结构；
+2. 将 `addons/due_client`、`README.md` 打包为 `due-client-godot-<tag>.zip`；
+3. 创建 GitHub Release、生成发布说明并上传压缩包；同名 Release 已存在时覆盖上传产物。
+
+也可以在 GitHub Actions 页面手动触发 `Release` 工作流并填写标签（标签不存在时会基于默认分支创建）。
+
+发布产物解压后，将其中的 `addons/due_client` 复制到 Godot 项目的 `addons` 目录即可使用。
+
 ## License
 
 [MIT](https://tldrlegal.com/license/mit-license)
